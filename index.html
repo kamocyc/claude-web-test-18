@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>地形変形・道路建設 技術プロトタイプ</title>
+    <!-- Inline favicon: avoids a 404 that would otherwise show up as a console error. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23223'/%3E%3Cpath d='M0 11l4-4 3 3 4-5 5 6v5H0z' fill='%236b8f4e'/%3E%3Crect x='6' y='11' width='4' height='3' fill='%23111'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./src/ui/style.css" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="crosshair"></div>
+    <div id="help">
+      <b>操作</b>
+      <div>左ドラッグ: 視点回転 / 右ドラッグ・中ドラッグ: 平行移動 / ホイール: ズーム</div>
+      <div>クリック: 選択中のツールを地表に適用</div>
+      <div>道路・トンネル: 1回目のクリックで始点、2回目で終点</div>
+      <div>1〜6: ツール切替 / C: 断面ビュー / H: ヒートマップ</div>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

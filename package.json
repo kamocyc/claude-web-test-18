@@ -1,0 +1,25 @@
+{
+  "name": "terrain-road-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tech prototype: SDF-voxel terrain deformation, road building, tunnel support and collapse",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173",
+    "test": "tsc --noEmit && node --test \"tests/*.test.ts\"",
+    "bench": "node bench/bench.mjs",
+    "smoke": "node tests/browser/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/three": "0.185.4",
+    "playwright": "^1.62.1",
+    "typescript": "~5.9.2",
+    "vite": "^8.0.0"
+  },
+  "dependencies": {
+    "three": "0.185.1"
+  }
+}
