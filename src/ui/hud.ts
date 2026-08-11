@@ -243,21 +243,25 @@ export class Hud {
       [HeadingState.COLLAPSED]: 3,
       [HeadingState.STABLE]: 4,
       [HeadingState.SUPPORTED]: 5,
+      [HeadingState.OPEN_CUT]: 6,
     };
     const sorted = [...headings].sort((a, b) => (order[a.state]! - order[b.state]!) || a.id - b.id);
     for (const h of sorted.slice(0, 8)) {
       const d = document.createElement('div');
       d.className = `heading ${h.state}`;
       const remain = h.standUpTime === Infinity ? null : Math.max(0, h.standUpTime - h.elapsed);
-      const bits = [
-        `#${h.id}`,
-        stateLabel(h.state),
-        `RMR ${h.rmr.toFixed(0)}`,
-        `無支保 ${h.allowedSpan.toFixed(1)}m / 掘削 ${h.span.toFixed(1)}m`,
-        `土被り ${h.cover.toFixed(0)}m`,
-        h.support !== 'none' ? supportLabel(h.support) : '',
-        remain !== null && h.state !== HeadingState.COLLAPSED ? `残り ${remain.toFixed(0)}s` : '',
-      ].filter(Boolean);
+      const bits =
+        h.state === HeadingState.OPEN_CUT
+          ? [`#${h.id}`, stateLabel(h.state), `掘削 ${h.span.toFixed(1)}m`, '天端崩落なし']
+          : [
+              `#${h.id}`,
+              stateLabel(h.state),
+              `RMR ${h.rmr.toFixed(0)}`,
+              `無支保 ${h.allowedSpan.toFixed(1)}m / 掘削 ${h.span.toFixed(1)}m`,
+              `土被り ${h.cover.toFixed(1)}m`,
+              h.support !== 'none' ? supportLabel(h.support) : '',
+              remain !== null && h.state !== HeadingState.COLLAPSED ? `残り ${remain.toFixed(0)}s` : '',
+            ].filter(Boolean);
       d.textContent = bits.join(' · ');
       this.headingsEl.appendChild(d);
     }

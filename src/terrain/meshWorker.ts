@@ -16,6 +16,7 @@ import { surfaceNets } from './surfaceNets.ts';
 import { buildChunkField } from './chunk.ts';
 import { allocChunkField } from './density.ts';
 import type { Brush } from './brush.ts';
+import { findFalling, type FallingCluster } from '../sim/detach.ts';
 
 export interface GenerateJob {
   id: number;
@@ -30,6 +31,9 @@ export interface GenerateJob {
 export interface RemeshJob {
   id: number;
   type: 'remesh';
+  cx: number;
+  cy: number;
+  cz: number;
   field: Float32Array;
   material: Uint8Array;
 }
@@ -47,6 +51,12 @@ export interface MeshResult {
   /** Present only for 'generate' jobs. */
   field?: Float32Array;
   material?: Uint8Array;
+  /**
+   * Rock that is no longer held up. Only produced for 'remesh' jobs, i.e. after
+   * an edit: the procedural terrain was measured to contain no detached bodies,
+   * so scanning freshly generated chunks would be pure cost.
+   */
+  falling?: FallingCluster[];
 }
 
 // One reusable field buffer per worker, for 'generate' jobs.
@@ -71,6 +81,9 @@ self.onmessage = (ev: MessageEvent<MeshJob>) => {
   }
 
   const mesh = surfaceNets(field, material);
+  // Detachment/overhang sweep rides along on the remesh: the field is already
+  // here and hot in cache, and the scan costs 0.66 ms against 1.6 ms to extract.
+  const falling = job.type === 'remesh' ? findFalling(field, material, job.cx, job.cy, job.cz) : undefined;
   const result: MeshResult = {
     id: job.id,
     positions: mesh.positions,
@@ -80,6 +93,7 @@ self.onmessage = (ev: MessageEvent<MeshJob>) => {
     vertexCount: mesh.vertexCount,
     triangleCount: mesh.triangleCount,
   };
+  if (falling && falling.length > 0) result.falling = falling;
   const transfer: Transferable[] = [
     mesh.positions.buffer,
     mesh.normals.buffer,

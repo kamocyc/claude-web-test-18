@@ -17,6 +17,7 @@ import { CrossSectionView } from './render/crossSection.ts';
 import { BearingOverlay } from './render/overlay.ts';
 import { DebrisSystem } from './sim/debris.ts';
 import { TunnelSim, HeadingState } from './sim/tunnel.ts';
+import { applyFalling } from './sim/detach.ts';
 import { overburdenAt } from './sim/stress.ts';
 import { rmrAt } from './terrain/geology.ts';
 import { surfaceHeight } from './terrain/geology.ts';
@@ -91,6 +92,48 @@ scene.add(startMarker);
 const world = new World(SEED, new MeshWorkerPool());
 world.setMeshListener((m) => chunkView.upsert(m));
 const tunnels = new TunnelSim();
+
+/**
+ * Rock the mesh worker found to be unsupported, after an edit: bodies severed
+ * from everything else, and overhangs cantilevered further than the rock carries.
+ * Supported headings are passed through so a lined tunnel's roof is not condemned
+ * by the sweep — from the player's side that would look like support not working.
+ */
+/** Cumulative record of rock that has fallen, for the headless smoke test. */
+const fallLog = { clusters: 0, skipped: 0, volume: 0, reasons: new Set<string>() };
+
+world.setFallingListener((clusters) => {
+  // Every tracked opening is excluded, not merely the supported ones. A tunnel
+  // roof is already governed by unsupported span and stand-up time, with cracking
+  // and convergence warnings on the way down, and the sweep has no timer at all —
+  // so letting both judge the same rock meant the sweep demolished the roof of a
+  // fresh 9 m heading in weathered soil within one remesh, before its clock could
+  // run. The heading then read as an open cut and never collapsed, which is both
+  // wrong and exactly the sort of unexplained outcome the staged warnings exist to
+  // avoid. The sweep's job is rock that no mechanic owns: undercut hillsides,
+  // severed pillars, slabs left hanging by an edit.
+  //
+  // Collapsed openings stay on the list too. Their ground has already been settled
+  // by the collapse — rock became rubble and the void was filled — and excluding
+  // them let the sweep carry the rubble column straight back out of the chimney,
+  // re-opening the tunnel it had just buried.
+  const protectedOpenings = tunnels
+    .all()
+    .map((h) => ({ center: h.center, span: h.span, cover: h.cover }));
+  const outcome = applyFalling(world, clusters, debris, protectedOpenings);
+  fallLog.clusters += outcome.clustersApplied;
+  fallLog.skipped += outcome.clustersSkipped;
+  fallLog.volume += outcome.volume;
+  for (const c of clusters) fallLog.reasons.add(c.reason);
+  if (outcome.clustersApplied > 0) {
+    const detached = clusters.filter((c) => c.reason === 'detached').length;
+    const overhang = clusters.filter((c) => c.reason === 'overhang').length;
+    const parts: string[] = [];
+    if (detached > 0) parts.push(`分離 ${detached}`);
+    if (overhang > 0) parts.push(`オーバーハング ${overhang}`);
+    hud.log(`支持を失った岩塊が落下: ${parts.join(' / ')} — ${outcome.volume.toFixed(1)} m³`);
+  }
+});
 
 // -------------------------------------------------------------- orbit camera ---
 
@@ -478,6 +521,7 @@ updateCamera();
 requestAnimationFrame(frame);
 
 // Expose a small surface for the headless smoke test to drive the prototype.
+// Named to stay well clear of __proto__, which is a live accessor on every object.
 interface ProtoHandle {
   world: World;
   tunnels: TunnelSim;
@@ -487,6 +531,8 @@ interface ProtoHandle {
   HeadingState: typeof HeadingState;
   surfaceHeight: (x: number, z: number) => number;
   ready: () => boolean;
+  fallLog: () => { clusters: number; skipped: number; volume: number; reasons: string };
+  resetFallLog: () => void;
 }
 
 const handle: ProtoHandle = {
@@ -501,5 +547,17 @@ const handle: ProtoHandle = {
   HeadingState,
   surfaceHeight: (x, z) => surfaceHeight(x, z, SEED),
   ready: () => world.stats().ready > 0,
+  fallLog: () => ({
+    clusters: fallLog.clusters,
+    skipped: fallLog.skipped,
+    volume: fallLog.volume,
+    reasons: [...fallLog.reasons].join('/'),
+  }),
+  resetFallLog: () => {
+    fallLog.clusters = 0;
+    fallLog.skipped = 0;
+    fallLog.volume = 0;
+    fallLog.reasons.clear();
+  },
 };
-(window as unknown as { __proto__test: ProtoHandle }).__proto__test = handle;
+(window as unknown as { __terrainProto: ProtoHandle }).__terrainProto = handle;

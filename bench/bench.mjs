@@ -13,7 +13,8 @@ import { surfaceNets } from '../src/terrain/surfaceNets.ts';
 import { applyBrushToField } from '../src/terrain/chunk.ts';
 import { makeBrush } from '../src/terrain/brush.ts';
 import { bearingCapacityOfMaterial } from '../src/sim/bearing.ts';
-import { surfaceHeight, Mat } from '../src/terrain/geology.ts';
+import { surfaceHeight, Mat, chokeHeight, materialProps } from '../src/terrain/geology.ts';
+import { findFalling } from '../src/sim/detach.ts';
 
 const SEED = 1337;
 
@@ -78,6 +79,23 @@ for (const [label, brush] of [
   });
 }
 
+console.log('\nsupport sweep — detached bodies and overhangs, riding along with the remesh');
+fillChunkField(buf, 0, 1, 0, SEED, CHUNK);
+const sweepMs = time('findFalling (whole chunk)', 200, () => {
+  findFalling(buf.field, buf.material, 0, 1, 0);
+}, () => `vs ${remeshMs.toFixed(2)} ms to re-extract`);
+console.log(`  ${'edit + remesh + sweep'.padEnd(34)} ${(edit + sweepMs).toFixed(2).padStart(7)} ms/chunk`);
+
+console.log('\nroof fall volumes (chimney model with bulking)');
+for (const [name, mat] of [['砂 (soil)', Mat.SAND], ['粘土 (clay)', Mat.CLAY], ['砂岩 (sandstone)', Mat.SANDSTONE], ['花崗岩 (granite)', Mat.GRANITE]]) {
+  const span = 6;
+  const b = materialProps(mat).bulking;
+  const choke = chokeHeight(mat, span);
+  console.log(
+    `  ${name.padEnd(20)} bulking ${b.toFixed(2)}  chokes after ${choke.toFixed(1).padStart(5)} m of chimney`,
+  );
+}
+
 console.log('\ngeotechnical evaluation (analytic — no field is ever solved)');
 time('Terzaghi bearing capacity', 200_000, (i) => {
   bearingCapacityOfMaterial(Mat.SAND, 2 + (i % 100) * 0.01, 1.5);
@@ -95,5 +113,8 @@ summary
   dominant cost, and it is a one-off per chunk.
   An edit costs ~${edit.toFixed(1)} ms of which the brush itself is ${(brushMs * 1000).toFixed(0)} us — the field is
   cached, so editing does not re-run the procedural base. Re-extraction dominates.
+  The support sweep that finds detached rock and over-long overhangs adds
+  ~${sweepMs.toFixed(2)} ms, and only runs on edited chunks: the procedural terrain was
+  measured to contain no detached bodies at all.
   The geotechnics are free at any scale a player can build to.
 `);

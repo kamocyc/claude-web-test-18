@@ -65,7 +65,7 @@ try {
   await page.goto(url, { waitUntil: 'load' });
 
   // --- the app boots and streams terrain -------------------------------------
-  await page.waitForFunction(() => window.__proto__test !== undefined, null, { timeout: 60_000 });
+  await page.waitForFunction(() => window.__terrainProto !== undefined, null, { timeout: 60_000 });
 
   // Shrink the streaming volume for the test. The production extent keeps ~3000
   // chunks resident, and this container has 4 cores driving a software GL
@@ -74,14 +74,14 @@ try {
   // checks deterministic: a raycast that leaves the loaded chunks returns null,
   // which is indistinguishable from "no ground here".
   await page.evaluate(() => {
-    window.__proto__test.world.extent = { radiusXZ: 6, minCy: -2, maxCy: 2 };
+    window.__terrainProto.world.extent = { radiusXZ: 6, minCy: -2, maxCy: 2 };
   });
   await page.waitForFunction(() => {
-    const s = window.__proto__test.stats();
+    const s = window.__terrainProto.stats();
     return s.chunks > 0 && s.ready === s.chunks && s.pendingGenerate === 0;
   }, null, { timeout: 180_000 });
 
-  const booted = await page.evaluate(() => window.__proto__test.stats());
+  const booted = await page.evaluate(() => window.__terrainProto.stats());
   check(booted.ready === booted.chunks && booted.chunks > 200,
     'terrain streams fully in a real browser', `${booted.ready}/${booted.chunks} chunks ready`);
   check(booted.triangles > 60_000, 'chunks are meshed by the worker pool', `${booted.triangles} triangles`);
@@ -98,7 +98,7 @@ try {
 
   // --- digging changes the terrain ------------------------------------------
   const dug = await page.evaluate(() => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     const y = h.surfaceHeight(0, 0);
     const before = h.world.raycast(0, 220, 0, 0, -1, 0, 400);
     if (!before) throw new Error('no ground under the origin');
@@ -113,10 +113,14 @@ try {
   // Both tunnel sites sit inside the shrunken streaming volume (radius 6 chunks
   // = 96 m), which is already fully resident by the check above.
   const bored = await page.evaluate(() => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     const surf = h.surfaceHeight(40, 0);
-    // Shallow: weathered soil, so a wide heading cannot possibly stand.
-    const y = surf - 7;
+    // Deep enough that there is more rock above the opening than the opening can
+    // hold, so the collapse can actually bury it. With only a metre or two of
+    // cover a 9 m heading collapses into a trench open to the sky, which is
+    // correct but is not what the burial check is about. Boring *along* the
+    // surface is a separate check below — that has no roof at all.
+    const y = surf - 22;
     h.driveTunnel([28, y, 0], [52, y, 0], 9);
     const hs = h.tunnels.all();
     return {
@@ -136,7 +140,7 @@ try {
 
   // Let real time pass: the sim ticks at 0.5 s and stand-up times are seconds.
   const collapsed = await page.waitForFunction(() => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     const states = h.headingStates();
     return states.includes(h.HeadingState.COLLAPSED) ? states : false;
   }, null, { timeout: 120_000 }).then((r) => r.jsonValue());
@@ -144,17 +148,106 @@ try {
     `states: ${[...new Set(collapsed)].join(', ')}`);
 
   const afterCollapse = await page.evaluate(() => {
-    const h = window.__proto__test;
-    return { stats: h.stats(), brushes: h.stats().brushes };
+    const h = window.__terrainProto;
+    const collapsedHeads = h.tunnels.all().filter((x) => x.state === 'collapsed');
+    const probes = collapsedHeads.map((x) => ({
+      id: x.id,
+      cover: x.cover,
+      density: h.world.sampleDensity(x.center[0], x.center[1], x.center[2]),
+      material: h.world.sampleMaterial(x.center[0], x.center[1], x.center[2]),
+      report: h.tunnels.lastCollapse,
+    }));
+    return { stats: h.stats(), probes };
   });
   check(afterCollapse.stats.brushes > 0, 'the collapse was written as CSG brushes',
     `${afterCollapse.stats.brushes} brushes in the diff`);
 
+  // The reported bug: a collapse used to leave an enormous open cavern because
+  // the fallen rock was never put back. The opening must end up buried.
+  const buried = afterCollapse.probes.filter((p) => p.density !== null && p.density < 0);
+  check(buried.length > 0, 'a collapse buries the opening in rubble rather than hollowing it out',
+    `${buried.length}/${afterCollapse.probes.length} collapsed sections now solid` +
+      ` (cover ${afterCollapse.probes.map((p) => p.cover.toFixed(0)).join('/')} m)`);
+  check(buried.some((p) => p.material === 11), 'what fills the opening is rubble',
+    `materials: ${[...new Set(afterCollapse.probes.map((p) => p.material))].join(', ')}`);
+  const rep = afterCollapse.probes.find((p) => p.report)?.report;
+  check(!!rep && rep.debrisVolume > rep.removedVolume,
+    'broken rock occupies more than it did intact (bulking)',
+    rep ? `removed ${rep.removedVolume.toFixed(0)} m3 -> debris ${rep.debrisVolume.toFixed(0)} m3, arrested by ${rep.arrestedBy}` : '');
+  check(!!rep && rep.residualVoid < rep.removedVolume,
+    'the residual cavity is smaller than the rock that fell into it',
+    rep ? `residual ${rep.residualVoid.toFixed(0)} m3` : '');
+
   await page.screenshot({ path: path.join(SHOTS, '03-after-collapse.png') });
+
+  // --- boring along the ground surface is a cut, not a tunnel ---------------
+  const openCut = await page.evaluate(() => {
+    const h = window.__terrainProto;
+    const hit = h.world.raycast(0, 220, 60, 0, -1, 0, 400);
+    if (!hit) return { error: 'no ground' };
+    const before = h.tunnels.all().length;
+    h.driveTunnel([hit.x - 12, hit.y, hit.z], [hit.x + 12, hit.y, hit.z], 6);
+    const fresh = h.tunnels.all().slice(before);
+    return {
+      n: fresh.length,
+      ids: fresh.map((x) => x.id),
+      states: fresh.map((x) => x.state),
+      covers: fresh.map((x) => x.cover),
+      clocks: fresh.map((x) => (x.standUpTime === Infinity ? 'none' : 'running')),
+    };
+  });
+  check(!openCut.error && openCut.states.every((s) => s === 'open_cut'),
+    'an opening bored along the surface is classified as an open cut',
+    `states: ${[...new Set(openCut.states ?? [])].join(', ')}, cover ${(openCut.covers ?? []).map((c) => c.toFixed(1)).join('/')} m`);
+  check(!openCut.error && openCut.clocks.every((c) => c === 'none'),
+    'an open cut starts no stand-up clock — there is no roof to fall');
+
+  await page.waitForTimeout(9000);
+  const cutLater = await page.evaluate((ids) => {
+    const h = window.__terrainProto;
+    return h.tunnels.all().filter((x) => ids.includes(x.id)).map((x) => x.state);
+  }, openCut.ids ?? []);
+  check(cutLater.length > 0 && cutLater.every((s) => s === 'open_cut'),
+    'an open cut still has not collapsed after 9 s',
+    `states: ${[...new Set(cutLater)].join(', ')}`);
+
+  // Ground above a tracked opening belongs to the tunnel sim, and the sweep must
+  // have declined to touch it while the tunnel above was collapsing. Read this
+  // before the counter is reset for the undercut, which happens far from any
+  // opening and would legitimately skip nothing.
+  const guarded = await page.evaluate(() => window.__terrainProto.fallLog());
+  check(guarded.skipped > 0, 'ground above a tracked opening is left to the tunnel sim',
+    `${guarded.skipped} clusters skipped as belonging to an opening,` +
+      ` ${guarded.clusters} applied elsewhere`);
+
+  // --- undercut terrain must fall rather than hang in the air ---------------
+  const undercut = await page.evaluate(() => {
+    const h = window.__terrainProto;
+    h.resetFallLog();
+    const hit = h.world.raycast(-40, 220, -40, 0, -1, 0, 400);
+    if (!hit) return { error: 'no ground' };
+    for (let dx = -8; dx <= 8; dx += 2) {
+      h.world.applyBrush({
+        kind: 'capsule', op: 'sub', mat: 0,
+        a: [-40 + dx, hit.y - 4, -48], b: [-40 + dx, hit.y - 4, -32], r: 2.2,
+      });
+    }
+    return { y: hit.y };
+  });
+  check(!undercut.error, 'undercut a 16 x 16 m area four metres down');
+
+  const fell = await page.waitForFunction(() => {
+    const log = window.__terrainProto.fallLog();
+    return log.clusters > 0 ? log : false;
+  }, null, { timeout: 60_000 }).then((r) => r.jsonValue()).catch(() => null);
+  check(!!fell && fell.clusters > 0, 'rock left without support is detected and falls',
+    fell ? `${fell.clusters} bodies, ${fell.volume.toFixed(0)} m3 (${fell.reasons})` : 'nothing fell');
+
+
 
   // --- a supported heading survives ----------------------------------------
   const supported = await page.evaluate(() => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     const surf = h.surfaceHeight(-60, 0);
     const y = surf - 24; // deeper: competent rock
     h.driveTunnel([-72, y, 0], [-48, y, 0], 6);
@@ -194,7 +287,7 @@ try {
   // Give the sim plenty of ticks to fail them if it were going to.
   await page.waitForTimeout(12_000);
   const stillSafe = await page.evaluate((ids) => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     return h.tunnels.all().filter((x) => ids.includes(x.id)).map((x) => x.state);
   }, supported.ids);
   check(
@@ -207,7 +300,7 @@ try {
   await page.keyboard.press('c');
   await page.waitForTimeout(1500);
   const sectionOn = await page.evaluate(() => {
-    const m = window.__proto__test.world;
+    const m = window.__terrainProto.world;
     void m;
     const sec = document.querySelector('canvas') !== null;
     return sec;
@@ -238,7 +331,7 @@ try {
 
   // --- save / load round-trip in the browser -------------------------------
   const roundTrip = await page.evaluate(() => {
-    const h = window.__proto__test;
+    const h = window.__terrainProto;
     const before = h.stats();
     const buttons = [...document.querySelectorAll('button')];
     buttons.find((b) => b.textContent === 'セーブ')?.click();

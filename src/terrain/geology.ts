@@ -38,6 +38,12 @@ export const Mat = {
   FILL: 9,
   /** Player-placed concrete (tunnel lining, road bed). */
   CONCRETE: 10,
+  /**
+   * Collapsed rock. Kept distinct from FILL: it is what a roof fall leaves
+   * behind, it carries almost no bearing capacity, and you cannot drive a new
+   * heading through it without support.
+   */
+  RUBBLE: 11,
 } as const;
 
 export type MaterialId = (typeof Mat)[keyof typeof Mat];
@@ -56,26 +62,58 @@ export interface MaterialProps {
   rmr: number;
   /** Hydraulic conductivity, m/s. Carried but unused in this slice. */
   permeability: number;
+  /**
+   * Bulking factor: the volume broken rock occupies relative to the intact rock
+   * it came from. Always > 1, which is the whole reason a collapse arrests —
+   * the debris takes up more room than the void it fell out of, so a chimney
+   * eventually chokes on its own rubble. Blocky rock bulks most (angular
+   * fragments lock together); soil bulks least, so it chimneys much further,
+   * which is exactly why sinkholes form over shallow workings in soft ground.
+   */
+  bulking: number;
   /** Base colour, sRGB triples in 0..1. */
   color: readonly [number, number, number];
 }
 
 export const MATERIALS: Record<number, MaterialProps> = {
-  [Mat.AIR]: { name: 'Air', gamma: 0, cohesion: 0, friction: 0, ucs: 0, rmr: 0, permeability: 0, color: [0, 0, 0] },
-  [Mat.TOPSOIL]: { name: '表土', gamma: 16, cohesion: 5, friction: 27, ucs: 0, rmr: 5, permeability: 1e-5, color: [0.30, 0.40, 0.17] },
-  [Mat.SAND]: { name: '砂', gamma: 18, cohesion: 0, friction: 33, ucs: 0, rmr: 8, permeability: 1e-4, color: [0.80, 0.70, 0.45] },
-  [Mat.CLAY]: { name: '粘土', gamma: 17, cohesion: 40, friction: 20, ucs: 0, rmr: 12, permeability: 1e-9, color: [0.46, 0.34, 0.28] },
-  [Mat.GRAVEL]: { name: '礫', gamma: 20, cohesion: 0, friction: 38, ucs: 0, rmr: 15, permeability: 1e-2, color: [0.56, 0.53, 0.48] },
-  [Mat.SANDSTONE]: { name: '砂岩', gamma: 23, cohesion: 300, friction: 40, ucs: 55, rmr: 55, permeability: 1e-7, color: [0.68, 0.57, 0.41] },
-  [Mat.LIMESTONE]: { name: '石灰岩', gamma: 24, cohesion: 500, friction: 38, ucs: 85, rmr: 65, permeability: 1e-6, color: [0.74, 0.74, 0.67] },
-  [Mat.GRANITE]: { name: '花崗岩', gamma: 26, cohesion: 1500, friction: 50, ucs: 160, rmr: 82, permeability: 1e-10, color: [0.58, 0.53, 0.57] },
-  [Mat.FAULT_GOUGE]: { name: '断層粘土', gamma: 19, cohesion: 15, friction: 18, ucs: 2, rmr: 18, permeability: 1e-6, color: [0.26, 0.22, 0.26] },
-  [Mat.FILL]: { name: '盛土', gamma: 19, cohesion: 8, friction: 30, ucs: 0, rmr: 6, permeability: 1e-5, color: [0.52, 0.41, 0.28] },
-  [Mat.CONCRETE]: { name: 'コンクリート', gamma: 24, cohesion: 4000, friction: 45, ucs: 35, rmr: 95, permeability: 1e-11, color: [0.82, 0.82, 0.84] },
+  [Mat.AIR]: { name: 'Air', gamma: 0, cohesion: 0, friction: 0, ucs: 0, rmr: 0, permeability: 0, bulking: 1, color: [0, 0, 0] },
+  [Mat.TOPSOIL]: { name: '表土', gamma: 16, cohesion: 5, friction: 27, ucs: 0, rmr: 5, permeability: 1e-5, bulking: 1.15, color: [0.30, 0.40, 0.17] },
+  [Mat.SAND]: { name: '砂', gamma: 18, cohesion: 0, friction: 33, ucs: 0, rmr: 8, permeability: 1e-4, bulking: 1.15, color: [0.80, 0.70, 0.45] },
+  [Mat.CLAY]: { name: '粘土', gamma: 17, cohesion: 40, friction: 20, ucs: 0, rmr: 12, permeability: 1e-9, bulking: 1.25, color: [0.46, 0.34, 0.28] },
+  [Mat.GRAVEL]: { name: '礫', gamma: 20, cohesion: 0, friction: 38, ucs: 0, rmr: 15, permeability: 1e-2, bulking: 1.2, color: [0.56, 0.53, 0.48] },
+  [Mat.SANDSTONE]: { name: '砂岩', gamma: 23, cohesion: 300, friction: 40, ucs: 55, rmr: 55, permeability: 1e-7, bulking: 1.4, color: [0.68, 0.57, 0.41] },
+  [Mat.LIMESTONE]: { name: '石灰岩', gamma: 24, cohesion: 500, friction: 38, ucs: 85, rmr: 65, permeability: 1e-6, bulking: 1.42, color: [0.74, 0.74, 0.67] },
+  [Mat.GRANITE]: { name: '花崗岩', gamma: 26, cohesion: 1500, friction: 50, ucs: 160, rmr: 82, permeability: 1e-10, bulking: 1.5, color: [0.58, 0.53, 0.57] },
+  [Mat.FAULT_GOUGE]: { name: '断層粘土', gamma: 19, cohesion: 15, friction: 18, ucs: 2, rmr: 18, permeability: 1e-6, bulking: 1.2, color: [0.26, 0.22, 0.26] },
+  [Mat.FILL]: { name: '盛土', gamma: 19, cohesion: 8, friction: 30, ucs: 0, rmr: 6, permeability: 1e-5, bulking: 1.1, color: [0.52, 0.41, 0.28] },
+  [Mat.CONCRETE]: { name: 'コンクリート', gamma: 24, cohesion: 4000, friction: 45, ucs: 35, rmr: 95, permeability: 1e-11, bulking: 1.45, color: [0.82, 0.82, 0.84] },
+  // Loose, uncompacted, poorly graded collapse debris: the weakest thing on the
+  // map. In reality its governing problem is enormous settlement rather than
+  // shear failure, which this model has no term for, so the compressibility is
+  // approximated by a low friction angle — enough to make the point that you
+  // cannot found on a collapse. bulking is 1: already-broken rock does not bulk
+  // again if it falls a second time.
+  [Mat.RUBBLE]: { name: '崩落土', gamma: 16, cohesion: 0, friction: 24, ucs: 0, rmr: 4, permeability: 1e-3, bulking: 1.0, color: [0.34, 0.30, 0.27] },
 };
 
 export function materialProps(id: number): MaterialProps {
   return MATERIALS[id] ?? MATERIALS[Mat.SAND]!;
+}
+
+/**
+ * Height a chimney can rise before its own bulked debris chokes it, given the
+ * height of the opening it started from.
+ *
+ *   removed = A*h,  debris = B*A*h,  space = A*(Ht + h)
+ *   choke when B*A*h = A*(Ht + h)  =>  h = Ht / (B - 1)
+ *
+ * Infinite for material that does not bulk (already-broken rubble): such a
+ * collapse never chokes itself and is arrested only by arching or by daylight.
+ */
+export function chokeHeight(mat: number, openingHeight: number): number {
+  const b = materialProps(mat).bulking;
+  if (b <= 1.0001) return Infinity;
+  return openingHeight / (b - 1);
 }
 
 /** One stratum: everything from `depth` metres downward until the next. */

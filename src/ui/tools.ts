@@ -58,12 +58,36 @@ export interface PendingSegment {
   start: Vec3;
 }
 
+/**
+ * Free-form excavation.
+ *
+ * The only difference from driveTunnel is the shape (a ball rather than a swept
+ * capsule) and the fact that a drive is a chain of sections you can support as a
+ * unit. The *physics* is identical: if the dig leaves rock overhead it becomes an
+ * opening judged by unsupported span and stand-up time, exactly like a heading.
+ * Before this, digging had no stability consequences at all, so you could hollow
+ * out an arbitrarily large chamber underground and nothing would ever happen.
+ */
 export function digAt(ctx: ToolContext, p: Vec3): void {
-  ctx.apply([makeBrush.dig(p, ctx.settings.radius)]);
+  const r = ctx.settings.radius;
+  ctx.apply([makeBrush.dig(p, r)]);
+  const opening = ctx.tunnels.addOpening(ctx.world, [p[0], p[1], p[2]], r * 2);
+  if (!opening) {
+    ctx.log(`掘削 r=${r.toFixed(1)} m — 地表の土工（切土）。天端が無いので崩落の対象外`);
+    return;
+  }
+  const clock = opening.standUpTime === Infinity ? '自立' : `自立時間 ${opening.standUpTime.toFixed(0)} s`;
+  ctx.log(
+    `掘削 r=${r.toFixed(1)} m → 地下空洞 #${opening.id} として登録 — ` +
+      `RMR ${opening.rmr.toFixed(0)}, 土被り ${opening.cover.toFixed(1)} m, ` +
+      `無支保スパン ${opening.allowedSpan.toFixed(1)} m vs 空洞 ${opening.span.toFixed(1)} m, ${clock}`,
+  );
 }
 
 export function fillAt(ctx: ToolContext, p: Vec3): void {
   ctx.apply([makeBrush.fill(p, ctx.settings.radius, Mat.FILL)]);
+  // Filling over an opening gives it a roof, so re-assessment happens on the next
+  // sim tick; nothing to register here.
 }
 
 /**
@@ -116,7 +140,7 @@ export function driveTunnel(ctx: ToolContext, a: Vec3, b: Vec3): void {
 
   const worst = ctx.tunnels
     .all()
-    .filter((h) => created.includes(h.id))
+    .filter((h) => created.includes(h.id) && h.hasRoof)
     .reduce<null | { rmr: number; allowed: number; t: number }>((acc, h) => {
       if (!acc || h.allowedSpan < acc.allowed) {
         return { rmr: h.rmr, allowed: h.allowedSpan, t: h.standUpTime };
@@ -125,10 +149,19 @@ export function driveTunnel(ctx: ToolContext, a: Vec3, b: Vec3): void {
     }, null);
 
   if (worst) {
+    const heads = ctx.tunnels.all().filter((h) => created.includes(h.id));
+    const cuts = heads.filter((h) => !h.hasRoof).length;
+    if (cuts === heads.length) {
+      ctx.log(
+        `掘進 ${len.toFixed(1)} m — 全 ${sections} 断面に天端が無く開削（切土）になりました。` +
+          `トンネルにするには土被りのある場所を指定してください`,
+      );
+      return;
+    }
     const clock = worst.t === Infinity ? '自立' : `自立時間 ${worst.t.toFixed(0)} s`;
     ctx.log(
-      `トンネル ${len.toFixed(1)} m 掘進 (${sections} 断面) — 最弱部 RMR ${worst.rmr.toFixed(0)}, ` +
-        `無支保スパン ${worst.allowed.toFixed(1)} m vs 掘削 ${span.toFixed(1)} m, ${clock}`,
+      `トンネル ${len.toFixed(1)} m 掘進 (${sections} 断面${cuts > 0 ? `、うち ${cuts} は開削` : ''}) — ` +
+        `最弱部 RMR ${worst.rmr.toFixed(0)}, 無支保スパン ${worst.allowed.toFixed(1)} m vs 掘削 ${span.toFixed(1)} m, ${clock}`,
     );
   }
 }

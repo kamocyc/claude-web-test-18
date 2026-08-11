@@ -30,6 +30,7 @@ import {
 } from './chunk.ts';
 import { MeshWorkerPool, type MeshPool } from './workerPool.ts';
 import type { MeshResult } from './meshWorker.ts';
+import type { FallingCluster } from '../sim/detach.ts';
 
 /** A finished mesh handed to the renderer. */
 export interface ChunkMesh {
@@ -83,6 +84,7 @@ export class World {
   private generating = new Set<ChunkKey>();
   private triangleCount = new Map<ChunkKey, number>();
   private onMeshReady: ((m: ChunkMesh) => void) | null = null;
+  private onFalling: ((c: FallingCluster[]) => void) | null = null;
 
   /**
    * @param pool  Mesh backend. Defaults to a Worker pool; tests and headless
@@ -96,6 +98,15 @@ export class World {
 
   setMeshListener(cb: (m: ChunkMesh) => void): void {
     this.onMeshReady = cb;
+  }
+
+  /**
+   * Called with rock the mesh worker found to be unsupported. The world does not
+   * act on it itself: turning a finding into terrain change means spawning debris
+   * and consulting the tunnel sim, which are the caller's concerns.
+   */
+  setFallingListener(cb: (c: FallingCluster[]) => void): void {
+    this.onFalling = cb;
   }
 
   getChunk(cx: number, cy: number, cz: number): Chunk | undefined {
@@ -240,11 +251,12 @@ export class World {
     // Copy: the buffers are transferred to the worker, and the main thread must
     // keep its authoritative field so the next edit does not have to wait.
     this.pool
-      .remesh(ch.field!.slice(), ch.material!.slice())
+      .remesh(ch.cx, ch.cy, ch.cz, ch.field!.slice(), ch.material!.slice())
       .then((r) => {
         if (!this.chunks.has(ch.key)) return;
         if (ch.version !== version) return; // stale, a newer remesh is queued
         this.deliver(ch, r);
+        if (r.falling && r.falling.length > 0 && this.onFalling) this.onFalling(r.falling);
       })
       .catch((e) => console.error('chunk remesh failed', ch.key, e));
   }

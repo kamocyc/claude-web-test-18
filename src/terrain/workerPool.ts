@@ -10,6 +10,7 @@ import type { MeshJob, MeshResult } from './meshWorker.ts';
 import type { Brush } from './brush.ts';
 import { buildChunkField } from './chunk.ts';
 import { surfaceNets } from './surfaceNets.ts';
+import { findFalling } from '../sim/detach.ts';
 /**
  * What World needs from a mesh backend. Implemented by MeshWorkerPool in the
  * browser and by SyncMeshPool in Node, so the whole chunk pipeline including
@@ -20,7 +21,7 @@ export interface MeshPool {
   readonly busy: number;
   readonly queueLength: number;
   generate(cx: number, cy: number, cz: number, seed: number, brushes: Brush[]): Promise<MeshResult>;
-  remesh(field: Float32Array, material: Uint8Array): Promise<MeshResult>;
+  remesh(cx: number, cy: number, cz: number, field: Float32Array, material: Uint8Array): Promise<MeshResult>;
   dispose(): void;
 }
 
@@ -72,8 +73,17 @@ export class MeshWorkerPool implements MeshPool {
    * Mesh a field the caller owns. The caller must pass copies: the buffers are
    * transferred to the worker and become unusable on this side.
    */
-  remesh(field: Float32Array, material: Uint8Array): Promise<MeshResult> {
-    return this.submit({ id: 0, type: 'remesh', field, material }, [field.buffer, material.buffer]);
+  remesh(
+    cx: number,
+    cy: number,
+    cz: number,
+    field: Float32Array,
+    material: Uint8Array,
+  ): Promise<MeshResult> {
+    return this.submit(
+      { id: 0, type: 'remesh', cx, cy, cz, field, material },
+      [field.buffer, material.buffer],
+    );
   }
 
   private submit(job: MeshJob, transfer: Transferable[]): Promise<MeshResult> {
@@ -138,9 +148,17 @@ export class SyncMeshPool implements MeshPool {
     };
   }
 
-  async remesh(field: Float32Array, material: Uint8Array): Promise<MeshResult> {
+  async remesh(
+    cx: number,
+    cy: number,
+    cz: number,
+    field: Float32Array,
+    material: Uint8Array,
+  ): Promise<MeshResult> {
     const mesh = surfaceNets(field, material);
+    const falling = findFalling(field, material, cx, cy, cz);
     return {
+      ...(falling.length > 0 ? { falling } : {}),
       id: this.nextId++,
       positions: mesh.positions,
       normals: mesh.normals,

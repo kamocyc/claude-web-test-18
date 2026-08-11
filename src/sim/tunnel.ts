@@ -19,6 +19,12 @@
  */
 import { SIM_TICK_SECONDS } from '../core/config.ts';
 import { makeBrush, type Brush } from '../terrain/brush.ts';
+import { chokeHeight, Mat, materialProps } from '../terrain/geology.ts';
+import { MIN_ROOF_COVER, shallowCoverFactor, standUpTime, unsupportedSpan } from './rockmass.ts';
+
+// Re-exported so existing callers and tests keep one import site for the tunnel
+// mechanic even though the formulas now live in rockmass.ts.
+export { MIN_ROOF_COVER, shallowCoverFactor, standUpTime, unsupportedSpan };
 import { overburdenAt, rockQualityAround } from './stress.ts';
 import type { World } from '../terrain/world.ts';
 
@@ -36,6 +42,16 @@ export const HeadingState = {
   COLLAPSED: 'collapsed',
   /** Support installed; permanently safe. */
   SUPPORTED: 'supported',
+  /**
+   * There is no rock overhead — this is a cutting, not a tunnel.
+   *
+   * Without this, boring along the ground surface produced a "tunnel" whose crown
+   * was several metres in the air with 0.00 m of cover, and the sim dutifully
+   * started a four-second stand-up clock and dropped a roof that did not exist.
+   * An open cut is governed by the stability of its cut faces (slope failure),
+   * which this prototype does not model, so the trench simply stays open.
+   */
+  OPEN_CUT: 'open_cut',
 } as const;
 
 export type HeadingStateValue = (typeof HeadingState)[keyof typeof HeadingState];
@@ -73,6 +89,8 @@ export interface Heading {
   rmr: number;
   cover: number;
   sigmaV: number;
+  /** True when there is real rock overhead; false makes this an open cut. */
+  hasRoof: boolean;
   /** Span this ground supports unaided, metres. */
   allowedSpan: number;
   /** Stand-up time for the current span, seconds. Infinity when stable. */
@@ -80,37 +98,22 @@ export interface Heading {
   weakestMat: number;
 }
 
-/**
- * Maximum unsupported span for a given rock mass rating, metres.
- *
- * Follows the shape of Bieniawski's span/stand-up-time chart: very poor rock
- * holds barely a metre, good rock holds tens of metres. Deep cover squeezes the
- * opening, so high vertical stress reduces the span.
- */
-export function unsupportedSpan(rmr: number, sigmaV: number): number {
-  // Calibrated against the shape of Bieniawski's chart: ~0.7 m at RMR 0,
-  // ~1.5 m at 20, ~5 m at 45, ~12.5 m at 75.
-  const base = 0.7 + 0.0021 * rmr * rmr;
-  // Reduce for high in-situ stress; 1.0 at shallow depth, ~0.6 at 3 MPa.
-  const stressFactor = 1 / (1 + sigmaV / 4500);
-  return base * stressFactor;
-}
-
-/**
- * Stand-up time in seconds for an opening of `span` in rock of the given RMR.
- *
- * Infinite while the span is within the unsupported limit; falls off sharply as
- * the opening gets wider than the rock allows. Compressed relative to reality
- * (hours become tens of seconds) so that a player can watch it happen.
- */
-export function standUpTime(rmr: number, span: number, allowed: number): number {
-  if (span <= allowed) return Infinity;
-  const over = span / allowed;
-  // Good rock still gives you a while; bad rock gives you seconds.
-  const base = 6 + rmr * 1.1;
-  // over^1.5 rather than over^2: squaring made every soil heading bottom out on
-  // the floor value, which removed the distinction between bad and very bad rock.
-  return Math.max(4, base / (over * Math.sqrt(over)));
+/** What one roof fall did, in volumes. */
+export interface CollapseReport {
+  id: number;
+  /** Intact rock removed from the chimney, m^3. */
+  removedVolume: number;
+  /** Volume that rock occupies once broken, m^3 (removedVolume * bulking). */
+  debrisVolume: number;
+  /** Height the debris reaches above the invert, m. */
+  fillHeight: number;
+  /** Void left over after the debris has settled, m^3. */
+  residualVoid: number;
+  /** How far the fall propagated above the crown, m. */
+  height: number;
+  /** Depth of the surface crater, m. Zero unless the fall reached daylight. */
+  craterDepth: number;
+  arrestedBy: 'arching' | 'choking' | 'daylight';
 }
 
 export interface TunnelEvent {
@@ -126,14 +129,61 @@ export class TunnelSim {
   /** Emitted brushes waiting to be applied by the caller. */
   private pendingBrushes: Brush[] = [];
   private events: TunnelEvent[] = [];
+  /**
+   * Volume accounting for the most recent collapse, so tests and the bench can
+   * assert that mass is conserved rather than inferring it from the geometry.
+   */
+  lastCollapse: CollapseReport | null = null;
 
   /**
    * Register a newly excavated heading. Call this right after applying the bore
    * brush, so the assessment sees the opening that was just made.
    */
   addHeading(world: World, center: [number, number, number], span: number): Heading {
+    const h = this.makeHeading(world, center, span);
+    this.headings.set(h.id, h);
+    return h;
+  }
+
+  /**
+   * Register an excavation as an opening only if it actually left rock overhead.
+   *
+   * This is what makes the free-form dig tool obey the same physics as the tunnel
+   * tool: any excavation with a roof is an opening and is judged by unsupported
+   * span and stand-up time, whichever button produced it. Surface earthworks (a
+   * cut or an embankment) have no roof and are not registered, so they neither
+   * collapse nor clutter the HUD.
+   *
+   * Repeated digging in one place updates the existing opening rather than piling
+   * up near-duplicates.
+   */
+  addOpening(world: World, center: [number, number, number], span: number): Heading | null {
+    const probe = this.makeHeading(world, center, span, /* consumeId */ false);
+    if (!probe.hasRoof) return null;
+
+    const existing = this.nearest(center[0], center[1], center[2], Math.max(2, span * 0.6));
+    if (existing && existing.state !== HeadingState.COLLAPSED) {
+      // Widen, never narrow: the opening is the union of what has been dug.
+      existing.span = Math.max(existing.span, span);
+      existing.center = center;
+      this.assess(world, existing);
+      this.classify(existing);
+      return existing;
+    }
+
+    const h = this.makeHeading(world, center, span);
+    this.headings.set(h.id, h);
+    return h;
+  }
+
+  private makeHeading(
+    world: World,
+    center: [number, number, number],
+    span: number,
+    consumeId = true,
+  ): Heading {
     const h: Heading = {
-      id: this.nextId++,
+      id: consumeId ? this.nextId++ : -1,
       center,
       span,
       support: SupportKind.NONE,
@@ -142,6 +192,7 @@ export class TunnelSim {
       rmr: 0,
       cover: 0,
       sigmaV: 0,
+      hasRoof: false,
       allowedSpan: 0,
       standUpTime: Infinity,
       weakestMat: 0,
@@ -152,7 +203,6 @@ export class TunnelSim {
     // is exactly the kind of "the UI said it was fine" gap that makes a collapse
     // look like a bug.
     this.classify(h);
-    this.headings.set(h.id, h);
     return h;
   }
 
@@ -170,6 +220,11 @@ export class TunnelSim {
     if (!h || h.state === HeadingState.COLLAPSED) return false;
     h.support = kind;
     this.assess(world, h);
+    if (!h.hasRoof) {
+      // Nothing to support: there is no roof. Leave it as a cut.
+      this.classify(h);
+      return true;
+    }
     if (h.span <= h.allowedSpan) {
       h.state = HeadingState.SUPPORTED;
       h.elapsed = 0;
@@ -212,9 +267,13 @@ export class TunnelSim {
     h.rmr = rq.samples > 0 ? Math.min(rq.meanRmr, rq.minRmr * 1.4) : 0;
     h.cover = ob.cover;
     h.sigmaV = ob.sigmaV;
+    h.hasRoof = ob.cover >= MIN_ROOF_COVER;
     h.weakestMat = rq.weakestMat >= 0 ? rq.weakestMat : ob.weakestMat;
-    h.allowedSpan = unsupportedSpan(h.rmr, ob.sigmaV) * SUPPORT_SPAN_FACTOR[h.support]!;
-    h.standUpTime = standUpTime(h.rmr, h.span, h.allowedSpan);
+    h.allowedSpan =
+      unsupportedSpan(h.rmr, ob.sigmaV) *
+      shallowCoverFactor(ob.cover, h.span) *
+      SUPPORT_SPAN_FACTOR[h.support]!;
+    h.standUpTime = h.hasRoof ? standUpTime(h.rmr, h.span, h.allowedSpan) : Infinity;
   }
 
   /**
@@ -231,6 +290,17 @@ export class TunnelSim {
     for (const h of this.headings.values()) {
       if (h.state === HeadingState.COLLAPSED || h.state === HeadingState.SUPPORTED) continue;
       this.assess(world, h);
+
+      // An opening can become a cut (the roof was dug away) or stop being one
+      // (the player filled over it), so this is re-decided every tick.
+      if (!h.hasRoof) {
+        if (h.state !== HeadingState.OPEN_CUT) {
+          h.state = HeadingState.OPEN_CUT;
+          h.elapsed = 0;
+          this.events.push({ kind: 'state', heading: h, message: '開削（切土）— 天端崩落なし' });
+        }
+        continue;
+      }
 
       if (h.span <= h.allowedSpan) {
         if (h.state !== HeadingState.STABLE) {
@@ -259,40 +329,129 @@ export class TunnelSim {
   }
 
   /**
-   * Turn a failed heading into terrain change.
+   * Height a roof fall rises before the rock mass arches over it, metres.
    *
-   * The roof falls as a cone above the opening, and the debris is piled back on
-   * the floor as a smaller sphere of loose fill — mass is not conserved exactly,
-   * but the visual reads correctly: you lose the opening and gain a rubble pile.
-   * If the cone reaches daylight, a surface sinkhole is added too.
+   * Weak, heavily jointed ground barely arches and chimneys a long way; competent
+   * rock forms a stable arch within one or two spans.
+   */
+  private archHeight(h: Heading): number {
+    return h.span * (1.4 + (60 - Math.min(60, h.rmr)) * 0.045);
+  }
+
+  /**
+   * Turn a failed heading into terrain change, conserving mass.
+   *
+   * Modelled as a vertical chimney of constant cross-section, which is both the
+   * realistic shape of a roof fall and the one that makes the volume arithmetic
+   * exact. Three things can arrest it, and whichever comes first wins:
+   *
+   *   arching  — the rock mass bridges over the hole (archHeight)
+   *   choking  — the fall buries itself in its own bulked debris (chokeHeight)
+   *   daylight — it reaches the surface, and the result is a sinkhole
+   *
+   * The debris volume is the removed volume times the material's bulking factor,
+   * and it is put back as RUBBLE filling the void from the invert upward. Without
+   * this the old implementation removed ~880 m3 and returned ~135 m3 of effective
+   * rubble for a 9 m heading — 85% of the rock simply vanished, which is why
+   * collapses left enormous open caverns instead of burying the tunnel.
    */
   private collapse(h: Heading): void {
-    const radius = h.span * 0.62;
-    // A weaker rock mass collapses further up before it arches over.
-    const height = Math.min(h.cover + 2, h.span * (1.4 + (60 - Math.min(60, h.rmr)) * 0.045));
-    const apex: [number, number, number] = [h.center[0], h.center[1] - h.span * 0.35, h.center[2]];
-    this.pendingBrushes.push(makeBrush.roofFall(apex, height, radius));
-    // Rubble on the invert.
-    this.pendingBrushes.push(
-      makeBrush.fill([h.center[0], h.center[1] - h.span * 0.42, h.center[2]], h.span * 0.42),
-    );
+    // Chimney cross-section: the opening's own footprint.
+    const radius = h.span * 0.5;
+    const area = Math.PI * radius * radius;
+    const openingHeight = h.span;
+    const invert = h.center[1] - openingHeight * 0.5;
+    const crown = h.center[1] + openingHeight * 0.5;
 
-    const brokeSurface = height >= h.cover;
+    const mat = h.weakestMat >= 0 ? h.weakestMat : Mat.CLAY;
+    const bulking = materialProps(mat).bulking;
+    const hArch = this.archHeight(h);
+    const hChoke = chokeHeight(mat, openingHeight);
+    // Daylight: the roof can only fall as far as there is rock above it.
+    const hDaylight = Math.max(0, h.cover);
+    const height = Math.min(hArch, hChoke, hDaylight);
+    const brokeSurface = height >= hDaylight - 1e-6 && hDaylight > 0;
+
+    const removed = area * height;
+    // Space the debris can occupy: the opening plus the chimney just excavated.
+    const voidVolume = area * openingHeight + removed;
+
+    // When the fall reaches daylight the surface has to subside, and that
+    // subsided material is itself rock that breaks and bulks. Sizing the crater
+    // from the volume deficit and then feeding it back into the debris budget is
+    // what keeps the accounting closed; simply carving a bowl at the surface
+    // would lose mass all over again, which is the bug this rewrite exists to fix.
+    const bowlRadius = Math.max(radius * 1.6, h.span);
+    // A smoothstep dish of radius r and depth d has volume ~= 0.5 * pi r^2 d.
+    const bowlUnitVolume = 0.5 * Math.PI * bowlRadius * bowlRadius;
+    let bowlDepth = 0;
+    if (brokeSurface) {
+      const deficit = Math.max(0, voidVolume - removed * bulking);
+      bowlDepth = Math.min(h.cover * 0.6, deficit / bowlUnitVolume);
+    }
+    const bowlVolume = bowlDepth * bowlUnitVolume;
+
+    const debris = (removed + bowlVolume) * bulking;
+    const totalVoid = voidVolume + bowlVolume;
+    const fillVolume = Math.min(debris, totalVoid);
+    const fillHeight = fillVolume / area;
+
+    // Brush order matters: both removals first, then the fill, because a later
+    // 'sub' would cut straight back through rubble placed by an earlier 'add'.
+    if (height > 0.05) {
+      // A vertical capsule is a cylinder with rounded ends, close enough to a
+      // chimney and needing no new brush kind.
+      this.pendingBrushes.push(
+        makeBrush.bore(
+          [h.center[0], crown, h.center[2]],
+          [h.center[0], crown + height, h.center[2]],
+          radius,
+        ),
+      );
+    }
+    if (bowlDepth > 0.05) {
+      // cover is measured upward from the crown (see assess()), so the ground
+      // surface is crown + cover. Measuring it from the heading centre instead
+      // put the crater half a span underground, where it quietly ate rock.
+      const surfaceY = crown + h.cover;
+      this.pendingBrushes.push(makeBrush.settle([h.center[0], surfaceY, h.center[2]], bowlRadius, bowlDepth));
+    }
+    if (fillHeight > 0.05) {
+      this.pendingBrushes.push({
+        kind: 'capsule',
+        op: 'add',
+        mat: Mat.RUBBLE,
+        a: [h.center[0], invert, h.center[2]],
+        b: [h.center[0], invert + fillHeight, h.center[2]],
+        r: radius,
+      });
+    }
+
+    this.lastCollapse = {
+      id: h.id,
+      removedVolume: removed + bowlVolume,
+      debrisVolume: debris,
+      fillHeight,
+      residualVoid: Math.max(0, totalVoid - debris),
+      height,
+      craterDepth: bowlDepth,
+      arrestedBy: brokeSurface ? 'daylight' : hArch <= hChoke ? 'arching' : 'choking',
+    };
+
+    const arrest =
+      brokeSurface ? '地表に到達'
+      : hArch <= hChoke ? `アーチ形成 (${hArch.toFixed(1)} m)`
+      : `瓦礫で閉塞 (${hChoke.toFixed(1)} m)`;
+
     this.events.push({
       kind: brokeSurface ? 'sinkhole' : 'collapse',
       heading: h,
       message: brokeSurface
-        ? `天端崩落が地表に到達 — 陥没 (土被り ${h.cover.toFixed(1)} m)`
-        : `天端崩落 (RMR ${h.rmr.toFixed(0)}, 支保なしスパン ${h.allowedSpan.toFixed(1)} m < 掘削 ${h.span.toFixed(1)} m)`,
+        ? `天端崩落が地表に到達 — 陥没 深さ ${bowlDepth.toFixed(1)} m ` +
+          `(土被り ${h.cover.toFixed(1)} m、${materialProps(mat).name} 膨れ ${bulking.toFixed(2)})`
+        : `天端崩落 ${height.toFixed(1)} m — ${arrest}、瓦礫 ${debris.toFixed(0)} m³ が坑道を埋没 ` +
+          `(RMR ${h.rmr.toFixed(0)}, 無支保 ${h.allowedSpan.toFixed(1)} m < 掘削 ${h.span.toFixed(1)} m)`,
     });
-
-    if (brokeSurface) {
-      // Break through to daylight: a bowl at the surface, centred over the hole.
-      const surfaceY = h.center[1] + h.cover;
-      this.pendingBrushes.push(
-        makeBrush.settle([h.center[0], surfaceY, h.center[2]], radius * 2.1, Math.min(6, h.cover * 0.5)),
-      );
-    }
   }
 
   /** Take the brushes produced by collapses since the last call. */
@@ -347,6 +506,10 @@ export class TunnelSim {
  * progression used by excavation, support installation and the timed tick alike.
  */
 export function classifyState(h: Heading): HeadingStateValue {
+  // No roof, nothing to fall. Checked before the span comparison because an open
+  // cut is always "over span" by the tunnel criterion and would otherwise start a
+  // deterioration clock for a roof that is not there.
+  if (!h.hasRoof) return HeadingState.OPEN_CUT;
   if (h.span <= h.allowedSpan) return HeadingState.STABLE;
   const frac = h.standUpTime === Infinity ? 0 : h.elapsed / h.standUpTime;
   if (frac >= 1) return HeadingState.COLLAPSED;
@@ -363,6 +526,7 @@ export function stateLabel(s: HeadingStateValue): string {
     case HeadingState.CRITICAL: return '崩落間近';
     case HeadingState.COLLAPSED: return '崩落';
     case HeadingState.SUPPORTED: return '支保済';
+    case HeadingState.OPEN_CUT: return '開削（切土）';
   }
 }
 
